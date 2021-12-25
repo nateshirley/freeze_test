@@ -4,11 +4,17 @@ import * as web3 from "@solana/web3.js";
 import { PublicKey, SystemProgram, Keypair } from "@solana/web3.js";
 import { FreezeTest } from "../target/types/freeze_test";
 import * as spl from "@solana/spl-token";
-import { Token, TOKEN_PROGRAM_ID, MintLayout } from "@solana/spl-token";
+import {
+  Token,
+  TOKEN_PROGRAM_ID,
+  MintLayout,
+  AccountLayout,
+} from "@solana/spl-token";
 import {
   createAssociatedTokenAccountInstruction,
   getAssociatedTokenAccountAddress,
 } from "./helpers/tokenHelpers";
+import { assert } from "chai";
 /*
 
 make a token 
@@ -31,10 +37,11 @@ describe("freeze_test", () => {
   const program = workspaceParent.workspace.FreezeTest as Program<FreezeTest>;
 
   let mint = Keypair.generate();
-  let mintAuthority = Keypair.generate();
+  let mintAuthority: Pda;
   let user = Keypair.generate();
   let TestToken: Token;
   let userTokenAccount: PublicKey;
+  let burnerTokenAccount = Keypair.generate();
   let other = Keypair.generate();
   let otherTokenAccount: PublicKey;
   let membership: Pda;
@@ -55,10 +62,15 @@ describe("freeze_test", () => {
       other.publicKey,
       mint.publicKey
     );
-    let [a, b] = await getMembershipAddress();
+    let [a, b] = await getMembershipAddress(user.publicKey);
     membership = {
       address: a,
       bump: b,
+    };
+    let [gA, gB] = await getGovernanceMintAuthority();
+    mintAuthority = {
+      address: gA,
+      bump: gB,
     };
     let configTransaction = new web3.Transaction().add(
       web3.SystemProgram.createAccount({
@@ -73,9 +85,9 @@ describe("freeze_test", () => {
       Token.createInitMintInstruction(
         TOKEN_PROGRAM_ID,
         mint.publicKey,
-        0,
-        mintAuthority.publicKey,
-        mintAuthority.publicKey
+        9,
+        mintAuthority.address,
+        mintAuthority.address
       ),
       createAssociatedTokenAccountInstruction(
         mint.publicKey,
@@ -88,12 +100,27 @@ describe("freeze_test", () => {
         otherTokenAccount,
         other.publicKey,
         user.publicKey
+      ),
+      web3.SystemProgram.createAccount({
+        fromPubkey: user.publicKey,
+        newAccountPubkey: burnerTokenAccount.publicKey,
+        space: AccountLayout.span,
+        lamports: await provider.connection.getMinimumBalanceForRentExemption(
+          AccountLayout.span
+        ),
+        programId: TOKEN_PROGRAM_ID,
+      }),
+      Token.createInitAccountInstruction(
+        TOKEN_PROGRAM_ID,
+        mint.publicKey,
+        burnerTokenAccount.publicKey,
+        user.publicKey
       )
     );
     await web3.sendAndConfirmTransaction(
       provider.connection,
       configTransaction,
-      [user, mint]
+      [user, mint, burnerTokenAccount]
     );
 
     TestToken = new Token(
@@ -102,10 +129,6 @@ describe("freeze_test", () => {
       TOKEN_PROGRAM_ID,
       user
     );
-    await TestToken.mintTo(userTokenAccount, mintAuthority, [], 100);
-    await TestToken.mintTo(otherTokenAccount, mintAuthority, [], 100);
-
-    printTokenBalance(userTokenAccount, "user token acct");
   });
 
   // it("freeze it", async () => {
@@ -117,16 +140,36 @@ describe("freeze_test", () => {
   //   printTokenBalance(otherTokenAccount, "user token acct");
   // });
 
-  it("create membership", async () => {
-    // Add your test here.
-    const tx = await program.rpc.createMembership(membership.bump, {
+  it("initialize", async () => {
+    const tx = await program.rpc.initialize(mintAuthority.bump, {
       accounts: {
-        creator: user.publicKey,
-        membership: membership.address,
+        initializer: user.publicKey,
+        governanceMintAuthority: mintAuthority.address,
         systemProgram: SystemProgram.programId,
       },
       signers: [user],
     });
+  });
+
+  it("create membership", async () => {
+    // Add your test here.
+    const tx = await program.rpc.createMembership(membership.bump, {
+      accounts: {
+        authority: user.publicKey,
+        membership: membership.address,
+        governanceTokenAccount: userTokenAccount,
+        governanceMint: mint.publicKey,
+        governanceMintAuthority: mintAuthority.address,
+        tokenProgram: TOKEN_PROGRAM_ID,
+        systemProgram: SystemProgram.programId,
+      },
+      signers: [user],
+    });
+
+    let newMemberGovAccount: any = await TestToken.getAccountInfo(
+      userTokenAccount
+    );
+    assert(newMemberGovAccount.amount.toNumber() === 100);
   });
 
   it("claim membership", async () => {
@@ -135,11 +178,40 @@ describe("freeze_test", () => {
         claimant: other.publicKey,
         membership: membership.address,
         governanceMint: mint.publicKey,
+        governanceMintAuthority: mintAuthority.address,
         claimantTokenAccount: otherTokenAccount,
         oldMemberTokenAccount: userTokenAccount,
+        tokenProgram: TOKEN_PROGRAM_ID,
       },
       signers: [other],
     });
+
+    let frozenAccount: any = await TestToken.getAccountInfo(userTokenAccount);
+    assert(frozenAccount.state === 2, "old member's token account is frozen");
+
+    let claimantTokenInfo = await TestToken.getAccountInfo(otherTokenAccount);
+    assert(
+      claimantTokenInfo.amount.toNumber() === 100,
+      "claimant has 100 gov tokens"
+    );
+  });
+
+  it("thaw old token account", async () => {
+    await program.rpc.thawGovernanceTokenAccount({
+      accounts: {
+        tokenAccountOwner: user.publicKey,
+        tokenAccount: userTokenAccount,
+        governanceMint: mint.publicKey,
+        governanceMintAuthority: mintAuthority.address,
+        burner: burnerTokenAccount.publicKey,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      },
+      signers: [user],
+    });
+
+    let info2 = await TestToken.getMintInfo();
+    console.log("token supply: ", info2.supply.toNumber());
+    assert(info2.supply.toNumber() === 100, "token supply 100 after burn");
   });
 
   const printTokenBalance = async (
@@ -151,9 +223,15 @@ describe("freeze_test", () => {
     );
     console.log(name + " balance: " + balance.value.uiAmount);
   };
-  const getMembershipAddress = () => {
+  const getMembershipAddress = (authority: PublicKey) => {
     return PublicKey.findProgramAddress(
-      [anchor.utils.bytes.utf8.encode("member")],
+      [anchor.utils.bytes.utf8.encode("member"), authority.toBytes()],
+      program.programId
+    );
+  };
+  const getGovernanceMintAuthority = () => {
+    return PublicKey.findProgramAddress(
+      [anchor.utils.bytes.utf8.encode("authority")],
       program.programId
     );
   };
